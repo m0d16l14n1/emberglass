@@ -27,7 +27,6 @@ in
         Restart = "on-failure";
         RestartSec = 5;
         Nice = 10;
-        DynamicUser = true;
         RuntimeDirectory = "emberglass";
         RuntimeDirectoryMode = "0755";
         RuntimeDirectoryPreserve = "yes";
