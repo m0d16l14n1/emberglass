@@ -1,0 +1,311 @@
+#!/usr/bin/python3 -I
+# SPDX-License-Identifier: GPL-2.0-or-later
+"""emberglass sampler: temperatures, clocks, power and memory of Apple silicon Macs, for panels and HUDs.
+
+One process reads the sensors once a second and writes small text files into /run/emberglass/ (RAM, a few hundred
+bytes). Panels and HUDs only read those files, so they never touch the hardware and nothing reaches the SMC twice.
+
+  panel.txt    one short line for a panel or bar          "52°  6.1 W  4.6 G"
+  detail.txt   the popup / tooltip, one value per line
+  hud.txt      one line for an in-game HUD (MangoHud: exec=cat /run/emberglass/hud.txt)
+  waybar.json  Waybar custom module (text, tooltip, class cool|warm|hot, percentage)
+
+A value is shown only when the machine really has it: a sensor that does not exist or reads nothing (no SoC die
+zone on this kernel, no GPU statistics, no power channel...) is left out, never shown as a dash.
+
+Sources (all read-only, all optional):
+  SoC die    thermal zone "soc-die-thermal" (macsmc hwmon die zone)
+  CPU / GPU  macsmc_hwmon temperatures named by the device tree's apple,soc-die-keys (Tp* P cores, Te* E cores,
+             Tg* GPU), else every Tp*/Te*/Tg* key the SMC reports; the hottest of each group
+  power      SMC "Total System Power"; battery power from macsmc_battery
+  GPU clock  agx_stats achieved_frequency_hz while pstate_status is valid
+  CPU        cpufreq policies (fastest cluster first) and load from /proc/stat
+  RAM        MemTotal - MemAvailable (as free(1)); swap when there is any; GPU share from gpu_memory
+  battery    capacity, AC, charge limit (charge_control_end_threshold)
+"""
+import glob
+import json
+import os
+import signal
+import time
+
+R = os.environ.get("EMBERGLASS_ROOT", "")   # tests: a fake /sys + /proc tree
+OUT = os.environ.get("EMBERGLASS_OUT", "/run/emberglass")
+PERIOD = float(os.environ.get("EMBERGLASS_PERIOD", "1"))
+WARM, HOT = 70, 90                            # Waybar classes, °C
+
+
+def rd(path):
+    try:
+        with open(path) as f:
+            return f.read().strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def num(path):
+    v = rd(path) if path else None
+    try:
+        return int(v) if v is not None else None
+    except ValueError:
+        return None
+
+
+def celsius(milli):
+    """A plausible temperature in °C, else None (a sensor reading 0 or nonsense counts as missing)."""
+    return milli / 1000 if milli is not None and 0 < milli < 150000 else None
+
+
+def find_hwmon(name):
+    for d in glob.glob(R + "/sys/class/hwmon/hwmon*"):
+        if rd(d + "/name") == name:
+            return d
+    return None
+
+
+def die_keys():
+    for p in glob.glob(R + "/proc/device-tree/**/apple,soc-die-keys", recursive=True):
+        try:
+            raw = open(p, "rb").read()
+        except OSError:
+            continue
+        return [k.decode(errors="replace") for k in raw.split(b"\0") if k]
+    return []
+
+
+class Sensors:
+    def __init__(self):
+        self.smc = find_hwmon("macsmc_hwmon")
+        self.bat = find_hwmon("macsmc_battery")
+        self.groups = {"P": [], "E": [], "G": []}
+        self.power = None
+        if self.smc:
+            by_label = {}
+            for lab in glob.glob(self.smc + "/*_label"):
+                by_label[rd(lab)] = lab[: -len("_label")] + "_input"
+            keys = [k for k in die_keys() if k in by_label] or [k for k in by_label if k and k[:2] in ("Tp", "Te", "Tg")]
+            for k in keys:
+                g = {"Tp": "P", "Te": "E", "Tg": "G"}.get(k[:2])
+                if g:
+                    self.groups[g].append(by_label[k])
+            self.power = by_label.get("Total System Power")
+        self.die = None
+        for z in glob.glob(R + "/sys/class/thermal/thermal_zone*"):
+            if rd(z + "/type") == "soc-die-thermal":
+                self.die = z + "/temp"
+        self.policies = []
+        for p in glob.glob(R + "/sys/devices/system/cpu/cpufreq/policy*"):
+            self.policies.append((num(p + "/cpuinfo_max_freq") or 0, p + "/scaling_cur_freq"))
+        self.policies.sort(reverse=True)   # fastest (P) cluster first
+        self.agx = (glob.glob(R + "/sys/class/drm/card*/device/agx_stats") or [None])[0]
+        self.gmem = (glob.glob(R + "/sys/class/drm/card*/device/gpu_memory") or [None])[0]
+        psu = glob.glob(R + "/sys/class/power_supply/*")
+        self.psu_bat = next((p for p in psu if rd(p + "/type") == "Battery"), None)
+        self.psu_ac = next((p for p in psu if rd(p + "/type") == "Mains"), None)
+        self.cpu_prev = None
+
+    def tmax(self, g):
+        vals = [c for c in (celsius(num(p)) for p in self.groups[g]) if c is not None]
+        return max(vals) if vals else None
+
+    def cpu_load(self):
+        f = rd(R + "/proc/stat")
+        if not f:
+            return None
+        v = [int(x) for x in f.splitlines()[0].split()[1:]]
+        idle, total = v[3] + (v[4] if len(v) > 4 else 0), sum(v)
+        prev, self.cpu_prev = self.cpu_prev, (idle, total)
+        if not prev or total == prev[1]:
+            return None
+        return 100.0 * (1 - (idle - prev[0]) / (total - prev[1]))
+
+    def mem(self):
+        m = {}
+        for line in (rd(R + "/proc/meminfo") or "").splitlines():
+            k, _, v = line.partition(":")
+            try:
+                m[k] = int(v.split()[0]) * 1024
+            except (ValueError, IndexError):
+                pass
+        total, avail = m.get("MemTotal"), m.get("MemAvailable")
+        used = total - avail if total and avail is not None else None
+        swap = m.get("SwapTotal", 0) - m.get("SwapFree", 0) if m.get("SwapTotal") else None
+        gpu = None
+        if self.gmem:
+            g = {}
+            for line in (rd(self.gmem) or "").splitlines():
+                k, _, v = line.partition(" ")
+                try:
+                    g[k] = int(v)
+                except ValueError:
+                    pass
+            if "user_resident" in g:
+                gpu = g["user_resident"] + g.get("kernel_resident", 0)
+        return used, total, swap, m.get("SwapTotal"), gpu
+
+    def gpu(self):
+        """(MHz or 0 when the GPU is idle, pstate); (None, None) when there are no GPU statistics."""
+        if not self.agx:
+            return None, None
+        st = {}
+        for line in (rd(self.agx) or "").splitlines():
+            k, _, v = line.partition(" ")
+            st[k] = v.strip()
+        if "pstate_status" not in st and "achieved_frequency_hz" not in st:
+            return None, None
+        try:
+            hz = int(st.get("achieved_frequency_hz", "0"))
+        except ValueError:
+            hz = 0
+        ps = st.get("pstate")
+        if st.get("pstate_status") == "valid" and hz > 0:
+            return hz / 1e6, ps
+        return 0, ps
+
+    def sample(self):
+        s = {"soc": celsius(num(self.die))}
+        s["p"], s["e"], s["g"] = self.tmax("P"), self.tmax("E"), self.tmax("G")
+        cpu = [t for t in (s["p"], s["e"]) if t is not None]
+        s["cpu"] = max(cpu) if cpu else None
+        w = num(self.power)
+        s["watts"] = w / 1e6 if w is not None and w >= 0 else None
+        s["load"] = self.cpu_load()
+        s["clk"] = [c / 1e6 for c in (num(cur) for _, cur in self.policies) if c]
+        s["gmhz"], s["pstate"] = self.gpu()
+        s["ram"], s["ramtot"], s["swap"], s["swaptot"], s["gpumem"] = self.mem()
+        b = num(self.bat + "/power1_input") if self.bat else None
+        s["batw"] = b / 1e6 if b is not None else None
+        s["batpct"] = num(self.psu_bat + "/capacity") if self.psu_bat else None
+        s["ac"] = (rd(self.psu_ac + "/online") == "1") if self.psu_ac else None
+        s["limit"] = num(self.psu_bat + "/charge_control_end_threshold") if self.psu_bat else None
+        s["start"] = num(self.psu_bat + "/charge_control_start_threshold") if self.psu_bat else None
+        s["batst"] = rd(self.psu_bat + "/status") if self.psu_bat else None
+        return s
+
+
+def deg(v):
+    return f"{v:.0f}°"
+
+
+def gb(v):
+    return f"{v / 2**30:.1f}"
+
+
+def headline(s):
+    """The one temperature for a panel: the SoC die if this machine has it, else the hottest CPU/GPU sensor."""
+    if s["soc"] is not None:
+        return s["soc"]
+    rest = [t for t in (s["cpu"], s["g"]) if t is not None]
+    return max(rest) if rest else None
+
+
+def render(s):
+    """-> hud, panel, detail, waybar (dict). Only values that exist are shown."""
+    t = headline(s)
+    w = f"{s['watts']:.1f} W" if s["watts"] is not None else None
+    gclk = None
+    if s["gmhz"] is not None:
+        gclk = f"{s['gmhz']:.0f} MHz" if s["gmhz"] else "idle"
+
+    panel = "  ".join(x for x in (deg(t) if t is not None else None, w,
+                                  f"{gb(s['ram'])} G" if s["ram"] is not None else None) if x)
+
+    hud = []
+    if s["soc"] is not None:
+        hud.append(f"SoC {deg(s['soc'])}C")
+    if s["cpu"] is not None:
+        hud.append(f"CPU {deg(s['cpu'])}")
+    gpu = " ".join(x for x in (deg(s["g"]) if s["g"] is not None else None, gclk) if x)
+    if gpu:
+        hud.append(f"GPU {gpu}")
+    if w:
+        hud.append(w)
+    if s["gpumem"] is not None:
+        hud.append(f"GPU mem {gb(s['gpumem'])} G")
+
+    lines = []
+
+    def row(name, value):
+        lines.append(f"{name:<13}{value}")
+
+    if s["soc"] is not None:
+        row("SoC die", f"{deg(s['soc'])}C")
+    if s["p"] is not None and s["e"] is not None:
+        row("CPU P / E", f"{deg(s['p'])}C / {deg(s['e'])}C")
+    elif s["cpu"] is not None:
+        row("CPU", f"{deg(s['cpu'])}C")
+    if gpu:
+        row("GPU", (f"{deg(s['g'])}C  " if s["g"] is not None else "") + (gclk or "")
+            + (f"  (pstate {s['pstate']})" if gclk and s["pstate"] not in (None, "0") else ""))
+    if s["clk"]:
+        row("CPU clock", " / ".join(f"{c:.2f}" for c in s["clk"]) + (" GHz (P / E)" if len(s["clk"]) == 2 else " GHz"))
+    if s["load"] is not None:
+        row("CPU load", f"{s['load']:.0f}%")
+    if w:
+        row("System power", w)
+    if s["ram"] is not None and s["ramtot"]:
+        row("RAM", f"{gb(s['ram'])} / {gb(s['ramtot'])} GB ({100 * s['ram'] / s['ramtot']:.0f}%)")
+    if s["swaptot"]:
+        row("Swap", f"{gb(s['swap'])} / {gb(s['swaptot'])} GB")
+    if s["gpumem"] is not None:
+        row("GPU memory", f"{gb(s['gpumem'])} GB (part of RAM)")
+    if s["batpct"] is not None:
+        bw = f", {abs(s['batw']):.1f} W {'in' if s['batw'] > 0 else 'out'}" if s["batw"] else ""
+        row("Battery", f"{s['batpct']}%{bw}" + (" (AC)" if s["ac"] else ""))
+        if s["limit"] is not None and 0 < s["limit"] < 100:
+            held = " - holding" if s["ac"] and s["batst"] in ("Not charging", "Full") else ""
+            resume = f" (resumes at {s['start']}%)" if s["start"] else ""
+            row("Charge limit", f"{s['limit']}%{resume}{held}")
+
+    detail = "\n".join(lines) if lines else "No sensors found."
+    cls = "cool" if t is None or t < WARM else ("warm" if t < HOT else "hot")
+    waybar = {"text": panel or "–", "tooltip": detail, "class": cls}
+    if t is not None:
+        waybar["percentage"] = int(min(100, max(0, t)))
+    return "  ".join(hud), panel or "–", detail, waybar
+
+
+def write(name, text):
+    tmp = f"{OUT}/.{name}.tmp"
+    with open(tmp, "w") as f:
+        f.write(text + "\n")
+    os.replace(tmp, f"{OUT}/{name}")
+
+
+def paused(*_):
+    # Stopped (for example while a benchmark measures without it): say so instead of showing frozen numbers.
+    write("hud.txt", "sensors paused")
+    write("panel.txt", "paused")
+    write("detail.txt", "The emberglass sampler is stopped (systemctl start emberglass to resume).")
+    write("waybar.json", json.dumps({"text": "paused", "tooltip": "emberglass sampler stopped", "class": "paused"}))
+    raise SystemExit(0)
+
+
+def main():
+    os.makedirs(OUT, exist_ok=True)
+    signal.signal(signal.SIGTERM, paused)
+    sensors = Sensors()
+    once = os.environ.get("EMBERGLASS_ONCE") == "1"
+    while True:
+        try:
+            s = sensors.sample()
+            if once and s["load"] is None:   # tests / `emberglass show`: two samples for a CPU load
+                time.sleep(0.2)
+                s = sensors.sample()
+            hud, panel, detail, waybar = render(s)
+            write("hud.txt", hud)
+            write("panel.txt", panel)
+            write("detail.txt", detail)
+            write("waybar.json", json.dumps(waybar, ensure_ascii=False))
+        except Exception as e:  # keep the last good files; one bad read must not stop the panel
+            try:
+                write("error.txt", repr(e))
+            except OSError:
+                pass
+        if once:
+            return
+        time.sleep(PERIOD)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,122 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# emberglass: Apple silicon sensors in your panel (KDE Plasma widget, Waybar module, MangoHud line, any bar).
+#
+#   emberglass                 what the sampler sees right now (the widget's popup text)
+#   emberglass watch           the same, refreshed every second (Ctrl-C to stop)
+#   emberglass panel add       put the "Emberglass" widget on your KDE Plasma panel (run as you, not root)
+#   emberglass panel remove    take it off again
+#   emberglass waybar add     add the module to ~/.config/waybar/config.jsonc (Omarchy, Hyprland, Sway...; backup kept)
+#   emberglass waybar remove   take it out again
+#   emberglass hud             the MangoHud line to add to ~/.config/MangoHud/MangoHud.conf
+#   emberglass version
+set -u
+VERSION=1.0.0
+RUN=${EMBERGLASS_OUT:-/run/emberglass}
+ID=org.emberglass.sensors
+MOD=custom/emberglass
+die() { echo "emberglass: $*" >&2; exit 1; }
+user_only() { [ "$(id -u)" != 0 ] || die "run this as your own user (not with sudo): it changes your desktop's settings"; }
+
+show() {
+  if [ -s "$RUN/detail.txt" ]; then cat "$RUN/detail.txt"
+  else echo "No data in $RUN yet. Is the sampler running?  systemctl status emberglass"; return 1; fi
+}
+
+# ------------------------------------------------------------------------------------------------- KDE Plasma
+plasma_js() {
+  case "$1" in
+    add) cat <<EOF
+const id = "$ID";
+const all = panels();
+let present = false;
+for (let i = 0; i < all.length; i++) { if (all[i].widgets(id).length > 0) present = true; }
+if (present) { print("already on a panel"); }
+else if (all.length === 0) { print("no panel"); }
+else {
+    let target = all[0];
+    for (let i = 0; i < all.length; i++) {
+        if (all[i].widgets("org.kde.plasma.systemtray").length > 0) { target = all[i]; break; }
+    }
+    target.addWidget(id);
+    print("added");
+}
+EOF
+    ;;
+    remove) cat <<EOF
+const id = "$ID";
+let n = 0;
+const all = panels();
+for (let i = 0; i < all.length; i++) { const w = all[i].widgets(id); for (let j = 0; j < w.length; j++) { w[j].remove(); n++; } }
+print("removed " + n);
+EOF
+    ;;
+  esac
+}
+plasma() {
+  user_only
+  command -v busctl >/dev/null || die "busctl (systemd) is needed to talk to Plasma"
+  busctl --user --no-pager status org.kde.plasmashell >/dev/null 2>&1 || die "Plasma is not running in this session"
+  out=$(busctl --user --no-pager call org.kde.plasmashell /PlasmaShell org.kde.PlasmaShell evaluateScript s "$(plasma_js "$1")" 2>&1) ||
+    die "Plasma refused the script: $out"
+  echo "Plasma: $(echo "$out" | sed 's/^s "//; s/\\n"$//; s/"$//')"
+  [ "$1" = add ] && echo "(Or by hand: right-click the panel > Add Widgets > \"Emberglass\".)"
+  return 0
+}
+
+# ------------------------------------------------------------------------------------------------------ Waybar
+# The module goes into the JSONC config as plain text between two marker comments, so it can be taken out again
+# exactly, and the user's own comments and layout are left as they are.
+WB_BEGIN="// emberglass:begin"; WB_END="// emberglass:end"
+waybar_cfg() {
+  for f in "${XDG_CONFIG_HOME:-$HOME/.config}/waybar/config.jsonc" "${XDG_CONFIG_HOME:-$HOME/.config}/waybar/config"; do
+    [ -f "$f" ] && { echo "$f"; return 0; }
+  done
+  return 1
+}
+waybar() {
+  user_only
+  f=$(waybar_cfg) || die "no Waybar config in ~/.config/waybar (config.jsonc or config)"
+  command -v python3 >/dev/null || die "python3 is needed to edit the Waybar config"
+  if [ "$1" = add ] && grep -q "$WB_BEGIN" "$f"; then echo "already in $f"; return 0; fi
+  if [ "$1" = remove ] && ! grep -q "$WB_BEGIN\|\"$MOD\"" "$f"; then echo "not in $f"; return 0; fi
+  [ "$1" = add ] && cp -p "$f" "$f.emberglass-backup"
+  python3 -I - "$1" "$f" "$RUN/waybar.json" <<'PY' || die "could not edit $f (unchanged)"
+import re, sys
+action, path, src = sys.argv[1:4]
+text = open(path).read()
+B, E, MOD = "// emberglass:begin", "// emberglass:end", "custom/emberglass"
+if action == "add":
+    m = re.search(r'"modules-right"\s*:\s*\[', text) or re.search(r'"modules-(?:center|left)"\s*:\s*\[', text)
+    if not m:
+        sys.exit("no modules-right/center/left list")
+    text = text[:m.end()] + f' "{MOD}", ' + text[m.end():]
+    block = (f'\n  {B}\n  "{MOD}": {{\n    "exec": "cat {src}",\n    "return-type": "json",\n'
+             f'    "interval": 2,\n    "tooltip": true\n  }},\n  {E}\n')
+    # right after the outermost opening brace (a top-level array of bars: into the first bar)
+    m = re.search(r'^\s*(?://[^\n]*\n\s*)*(\[\s*)?\{', text)
+    if not m:
+        sys.exit("unexpected config layout")
+    text = text[:m.end()] + block + text[m.end():]
+else:
+    text = re.sub(r'\n?[ \t]*' + re.escape(B) + r'.*?' + re.escape(E) + r'[ \t]*\n?', "\n", text, flags=re.S)
+    text = re.sub(r'\s*"' + re.escape(MOD) + r'"\s*,', "", text, count=1)
+    text = re.sub(r',\s*"' + re.escape(MOD) + r'"(\s*\])', r'\1', text)
+open(path + ".emberglass-tmp", "w").write(text)
+import os
+os.replace(path + ".emberglass-tmp", path)
+PY
+  echo "Waybar: $1 done in $f$( [ "$1" = add ] && echo " (backup: $f.emberglass-backup)")"
+  pkill -SIGUSR2 -x waybar 2>/dev/null && echo "Waybar reloaded." || echo "Restart Waybar to see it (Omarchy: omarchy-restart-waybar)."
+}
+
+case "${1:-show}" in
+  show|status) show ;;
+  watch) while :; do clear; date '+%T'; show; sleep 1; done ;;
+  panel|plasma) case "${2:-add}" in add|remove) plasma "$2" ;; *) die "panel add|remove" ;; esac ;;
+  waybar) case "${2:-add}" in add|remove) waybar "$2" ;; *) die "waybar add|remove" ;; esac ;;
+  hud) echo "Add this line to ~/.config/MangoHud/MangoHud.conf:"; echo "exec=cat $RUN/hud.txt" ;;
+  version|--version) echo "emberglass $VERSION" ;;
+  -h|--help|help) sed -n '3,13p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) sed -n '5,13p' "$0" | sed 's/^# \{0,1\}//'; exit 2 ;;
+esac

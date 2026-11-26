@@ -1,0 +1,19 @@
+{
+    "KPlugin": {
+        "Authors": [
+            {
+                "Name": "emberglass contributors"
+            }
+        ],
+        "Category": "System Information",
+        "Description": "Temperatures, clocks, power and memory of Apple silicon Macs (from the emberglass sampler)",
+        "Icon": "temperature-normal",
+        "Id": "org.emberglass.sensors",
+        "License": "GPL-2.0-or-later",
+        "Name": "Emberglass",
+        "Version": "1.0.0",
+        "Website": "https://github.com/m0d16l14n1/emberglass"
+    },
+    "KPackageStructure": "Plasma/Applet",
+    "X-Plasma-API-Minimum-Version": "6.0"
+}
